@@ -1,0 +1,645 @@
+package im.expensive.functions.impl.combat;
+
+import com.google.common.eventbus.Subscribe;
+import im.expensive.Expensive;
+import im.expensive.command.friends.FriendStorage;
+import im.expensive.events.EventInput;
+import im.expensive.events.EventMotion;
+import im.expensive.events.EventUpdate;
+import im.expensive.functions.api.Category;
+import im.expensive.functions.api.Function;
+import im.expensive.functions.api.FunctionRegister;
+import im.expensive.functions.settings.impl.BooleanSetting;
+import im.expensive.functions.settings.impl.ModeListSetting;
+import im.expensive.functions.settings.impl.ModeSetting;
+import im.expensive.functions.settings.impl.SliderSetting;
+import im.expensive.utils.math.SensUtils;
+import im.expensive.utils.math.StopWatch;
+import im.expensive.utils.player.AntiBot;          // добавлен импорт
+import im.expensive.utils.player.InventoryUtil;
+import im.expensive.utils.player.MouseUtil;
+import im.expensive.utils.player.MoveUtils;
+import net.minecraft.client.entity.player.ClientPlayerEntity;
+import net.minecraft.enchantment.EnchantmentHelper;
+import net.minecraft.enchantment.Enchantments;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.item.ArmorStandEntity;
+import net.minecraft.entity.monster.MonsterEntity;
+import net.minecraft.entity.passive.AnimalEntity;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.inventory.container.ClickType;
+import net.minecraft.item.*;
+import net.minecraft.network.play.client.CHeldItemChangePacket;
+import net.minecraft.tags.FluidTags;
+import net.minecraft.util.Hand;
+import net.minecraft.util.math.MathHelper;
+import net.minecraft.util.math.RayTraceContext;
+import net.minecraft.util.math.RayTraceResult;
+import net.minecraft.util.math.vector.Vector2f;
+import net.minecraft.util.math.vector.Vector3d;
+
+import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
+
+import static java.lang.Math.hypot;
+import static net.minecraft.util.math.MathHelper.clamp;
+import static net.minecraft.util.math.MathHelper.wrapDegrees;
+
+@FunctionRegister(name = "KillAura", type = Category.Combat)
+public class KillAura extends Function {
+
+    // Только LegitAim (скрыт, оставлен для совместимости)
+    private final ModeSetting type = new ModeSetting("Тип", "LegitAim", "LegitAim").setVisible(() -> false);
+
+    private final SliderSetting attackRange = new SliderSetting("Дистанция атаки", 3f, 3f, 6f, 0.1f);
+    private final SliderSetting aimRange = new SliderSetting("Дистанция наводки", 6f, 3f, 12f, 0.1f);
+    private final SliderSetting fov = new SliderSetting("FOV", 180f, 30f, 180f, 1f);
+    private final ModeSetting sortMode = new ModeSetting("Сортировать", "По всему", "По всему", "По здоровью", "По броне", "По дистанции", "По обзору");
+
+    // Настройки LegitAim
+    private final SliderSetting headRandomYaw = new SliderSetting("Случайный Yaw", 0.8f, 0.0f, 5.0f, 0.1f);
+    private final SliderSetting headRandomPitch = new SliderSetting("Случайный Pitch", 0.4f, 0.0f, 3.0f, 0.1f);
+    private final SliderSetting headRandomDelay = new SliderSetting("Задержка смены", 10f, 1f, 30f, 1f);
+    private final ModeSetting headRandomType = new ModeSetting("Тип рандома", "Плавный", "Плавный", "Рывками", "Случайные точки");
+
+    // Таргеты
+    final ModeListSetting targets = new ModeListSetting("Таргеты",
+            new BooleanSetting("Игроки", true),
+            new BooleanSetting("Голые", true),
+            new BooleanSetting("Мобы", false),
+            new BooleanSetting("Животные", false),
+            new BooleanSetting("Друзья", false),
+            new BooleanSetting("Голые невидимки", true),
+            new BooleanSetting("Невидимки", true),
+            new BooleanSetting("Боты", false));
+
+    // Основные опции
+    final ModeListSetting options = new ModeListSetting("Опции",
+            new BooleanSetting("Только криты", false),
+            new BooleanSetting("Ломать щит", true),
+            new BooleanSetting("Отжимать щит", true),
+            new BooleanSetting("Ускорять ротацию при атаке", true),
+            new BooleanSetting("Фокусировать одну цель", true),
+            new BooleanSetting("Коррекция движения", true),
+            new BooleanSetting("Не бить при использовании", false),
+            new BooleanSetting("Не бить через стены", false),
+            new BooleanSetting("Атака в воде", true));
+
+    // Таймер атаки
+    private final StopWatch attackTimer = new StopWatch();
+
+    // Цель
+    private LivingEntity target;
+    private Entity selected;
+
+    // Общие переменные для LegitAim
+    private float aimHeightFactor = 0.8f;
+    private int noRotationTicks = 0;
+    private boolean shouldSkipRotation = false;
+    private Random random = new Random();
+    private float rotationSpeed = 15f; // используется при ускорении
+
+    // Переменные для рандомизации головы
+    private float headRandomCurrentYaw = 0f;
+    private float headRandomCurrentPitch = 0f;
+    private float headRandomTargetYaw = 0f;
+    private float headRandomTargetPitch = 0f;
+    private int headRandomChangeTimer = 0;
+    private float headRandomSmoothFactor = 0.15f;
+
+    // Для плавного поворота тела
+    private float lastBodyYaw = 0F;
+
+    final AutoPotion autoPotion;
+
+    public KillAura(AutoPotion autoPotion) {
+        this.autoPotion = autoPotion;
+
+        addSettings(
+                type,
+                attackRange,
+                aimRange,
+                fov,
+                sortMode,
+                headRandomYaw,
+                headRandomPitch,
+                headRandomDelay,
+                headRandomType,
+                targets,
+                options
+        );
+    }
+
+    @Subscribe
+    public void onInput(EventInput eventInput) {
+        if (options.getValueByName("Коррекция движения").get() && target != null && mc.player != null) {
+            MoveUtils.fixMovement(eventInput, rotateVector.x);
+        }
+    }
+
+    @Subscribe
+    public void onUpdate(EventUpdate e) {
+        // Обновление рандомизации головы
+        updateHeadRandomization();
+
+        if (options.getValueByName("Фокусировать одну цель").get() && (target == null || !isValid(target)) || !options.getValueByName("Фокусировать одну цель").get()) {
+            updateTarget();
+        }
+
+        if (target != null && !(autoPotion.isState() && autoPotion.isActive()) && !isUsingItem()) {
+            // Всегда LegitAim
+            updateLegitAim();
+
+            if (shouldPlayerAttack() && canAttack()) {
+                updateAttack();
+            }
+        } else {
+            attackTimer.setLastMS(0);
+            reset();
+        }
+
+        // Обновляем таймеры
+        if (noRotationTicks > 0) noRotationTicks--;
+
+        // Иногда пропускаем тик ротации
+        if (random.nextInt(50) == 0) {
+            shouldSkipRotation = true;
+        } else {
+            shouldSkipRotation = false;
+        }
+    }
+
+    @Subscribe
+    private void onWalking(EventMotion e) {
+        if (target == null || autoPotion.isState() && autoPotion.isActive()) return;
+
+        float yaw = rotateVector.x;
+        float pitch = rotateVector.y;
+
+        // Добавляем рандомизацию головы
+        yaw += headRandomCurrentYaw;
+        pitch += headRandomCurrentPitch;
+
+        // Поворот головы для LegitAim
+        float headYaw = yaw;
+        float headPitch = MathHelper.clamp(pitch, -89.0F, 89.0F);
+        float gcd = SensUtils.getGCDValue();
+        headYaw -= (headYaw - mc.player.rotationYawHead) % gcd;
+        headPitch -= (headPitch - mc.player.rotationPitchHead) % gcd;
+
+        mc.player.rotationYawHead = headYaw;
+        mc.player.rotationPitchHead = headPitch;
+
+        // Плавный поворот тела (для реализма)
+        float bodyTargetYaw = rotateVector.x;
+        float yawDifference = MathHelper.wrapDegrees(bodyTargetYaw - lastBodyYaw);
+        float bodyYaw = lastBodyYaw;
+        if (Math.abs(yawDifference) > 0.1F) {
+            bodyYaw += yawDifference / 5f;
+        }
+        mc.player.renderYawOffset = bodyYaw;
+        mc.player.prevRenderYawOffset = lastBodyYaw;
+        lastBodyYaw = bodyYaw;
+
+        e.setYaw(yaw);
+        e.setPitch(pitch);
+    }
+
+    // ================== МЕТОДЫ ДЛЯ LegitAim ==================
+
+    private void updateLegitAim() {
+        if (target == null || mc.player == null) return;
+
+        if (noRotationTicks > 0 || shouldSkipRotation) {
+            return;
+        }
+
+        Vector3d vec = target.getPositionVec().add(0, target.getHeight() * aimHeightFactor, 0)
+                .subtract(mc.player.getEyePosition(1.0F));
+
+        float targetYaw = (float) MathHelper.wrapDegrees(Math.toDegrees(Math.atan2(vec.z, vec.x)) - 90);
+        float targetPitch = (float) (-Math.toDegrees(Math.atan2(vec.y, hypot(vec.x, vec.z))));
+
+        // Небольшой случайный шум
+        targetYaw += (random.nextFloat() - 0.5f) * 0.8f;
+        targetPitch += (random.nextFloat() - 0.5f) * 0.4f;
+
+        float yawDelta = wrapDegrees(targetYaw - rotateVector.x);
+        float pitchDelta = wrapDegrees(targetPitch - rotateVector.y);
+
+        float speed = 12f + random.nextFloat() * 3f;
+        speed *= getWaterSlowdown(); // замедление в воде
+
+        if (Math.abs(yawDelta) < 5f) {
+            speed *= 0.7f;
+        }
+
+        float yawSpeed = Math.min(Math.abs(yawDelta), speed);
+        float pitchSpeed = Math.min(Math.abs(pitchDelta), speed * 0.5f);
+
+        if (Math.abs(yawDelta) > 3f) {
+            yawSpeed *= (0.9f + random.nextFloat() * 0.2f);
+        }
+
+        float finalYaw = rotateVector.x + (yawDelta > 0 ? yawSpeed : -yawSpeed);
+        float finalPitch = clamp(rotateVector.y + (pitchDelta > 0 ? pitchSpeed : -pitchSpeed), -89.0F, 89.0F);
+
+        float gcd = SensUtils.getGCDValue();
+        finalYaw -= (finalYaw - rotateVector.x) % gcd;
+        finalPitch -= (finalPitch - rotateVector.y) % gcd;
+
+        // Иногда резкий скачок (имитация мыши)
+        if (random.nextInt(50) == 0) {
+            finalYaw += (random.nextFloat() - 0.5f) * 2f;
+            finalPitch += (random.nextFloat() - 0.5f) * 1f;
+            noRotationTicks = 1 + random.nextInt(2);
+        }
+
+        rotateVector = new Vector2f(finalYaw, finalPitch);
+
+        if (options.getValueByName("Коррекция движения").get()) {
+            mc.player.rotationYawOffset = finalYaw;
+        }
+    }
+
+    private void updateHeadRandomization() {
+        if (headRandomChangeTimer > 0) {
+            headRandomChangeTimer--;
+        } else {
+            headRandomTargetYaw = (random.nextFloat() - 0.5f) * 2f * headRandomYaw.get();
+            headRandomTargetPitch = (random.nextFloat() - 0.5f) * 2f * headRandomPitch.get();
+
+            float delayFloat = headRandomDelay.get();
+            int delay = (int) delayFloat;
+            if (headRandomType.is("Рывками")) {
+                int halfDelay = Math.max(1, delay / 2);
+                delay = halfDelay + random.nextInt(halfDelay);
+            }
+            headRandomChangeTimer = Math.max(1, delay);
+        }
+
+        if (headRandomType.is("Плавный")) {
+            headRandomCurrentYaw = lerp(headRandomCurrentYaw, headRandomTargetYaw, headRandomSmoothFactor);
+            headRandomCurrentPitch = lerp(headRandomCurrentPitch, headRandomTargetPitch, headRandomSmoothFactor);
+        } else if (headRandomType.is("Рывками")) {
+            if (headRandomChangeTimer == 0) {
+                headRandomCurrentYaw = headRandomTargetYaw;
+                headRandomCurrentPitch = headRandomTargetPitch;
+            }
+        } else if (headRandomType.is("Случайные точки")) {
+            if (headRandomChangeTimer == 0 || random.nextInt(5) == 0) {
+                headRandomCurrentYaw = (random.nextFloat() - 0.5f) * 2f * headRandomYaw.get();
+                headRandomCurrentPitch = (random.nextFloat() - 0.5f) * 2f * headRandomPitch.get();
+            }
+        }
+    }
+
+    private float lerp(float start, float end, float factor) {
+        return start + (end - start) * factor;
+    }
+
+    // ================== ПРОВЕРКИ АТАКИ ==================
+
+    private float getWaterSlowdown() {
+        boolean allowWater = options.getValueByName("Атака в воде").get();
+        return (allowWater && mc.player != null && mc.player.isInWater()) ? 0.6f : 1.0f;
+    }
+
+    private boolean shouldPlayerAttack() {
+        if (mc.player == null) return false;
+
+        float attackStrength = mc.player.getCooledAttackStrength(1.5f);
+        if (attackStrength < 0.85f) return false;
+
+        if (options.getValueByName("Только криты").get()) {
+            if (mc.player.isInWater()) return false; // в воде криты невозможны
+            return !mc.player.isOnGround() && mc.player.fallDistance > 0;
+        }
+
+        boolean cancelReason = mc.player.isInLava() ||
+                mc.player.isOnLadder() ||
+                mc.player.isPassenger() ||
+                mc.player.abilities.isFlying;
+
+        boolean allowWater = options.getValueByName("Атака в воде").get();
+        if (!allowWater && mc.player.isInWater()) {
+            cancelReason = true;
+        }
+
+        return !cancelReason;
+    }
+
+    private boolean canAttack() {
+        long baseDelay = 350 + random.nextInt(100); // для LegitAim
+        long currentTime = System.currentTimeMillis();
+        long lastAttackTime = attackTimer.getLastMS();
+        long delay = baseDelay;
+
+        boolean allowWater = options.getValueByName("Атака в воде").get();
+        if (allowWater && mc.player.isInWater()) {
+            delay += 50;
+        }
+
+        return currentTime - lastAttackTime >= delay;
+    }
+
+    // ================== ОБНОВЛЕНИЕ ЦЕЛИ ==================
+
+    private void updateTarget() {
+        List<LivingEntity> targets = new ArrayList<>();
+
+        for (Entity entity : mc.world.getAllEntities()) {
+            if (entity instanceof LivingEntity living && isValid(living)) {
+                if (isWithinFOV(living)) {
+                    targets.add(living);
+                }
+            }
+        }
+
+        if (targets.isEmpty()) {
+            target = null;
+            return;
+        }
+
+        if (targets.size() == 1) {
+            target = targets.get(0);
+            return;
+        }
+
+        switch (sortMode.get()) {
+            case "По всему":
+                Collections.shuffle(targets, random);
+                break;
+            case "По здоровью":
+                targets.sort(Comparator.comparingDouble(this::getEntityHealth));
+                break;
+            case "По броне":
+                targets.sort(Comparator.comparingDouble(entity ->
+                        entity instanceof PlayerEntity ? getEntityArmor((PlayerEntity) entity) : entity.getTotalArmorValue()));
+                break;
+            case "По дистанции":
+                targets.sort(Comparator.comparingDouble(entity -> mc.player.getDistance(entity)));
+                break;
+            case "По обзору":
+                targets.sort(Comparator.comparingDouble(this::getFovToEntity));
+                break;
+            default:
+                targets.sort(Comparator.comparingDouble(object -> {
+                    if (object instanceof PlayerEntity player) {
+                        return -getEntityArmor(player);
+                    }
+                    if (object instanceof LivingEntity base) {
+                        return -base.getTotalArmorValue();
+                    }
+                    return 0.0;
+                }).thenComparing((object, object2) -> {
+                    double d2 = getEntityHealth((LivingEntity) object);
+                    double d3 = getEntityHealth((LivingEntity) object2);
+                    return Double.compare(d2, d3);
+                }).thenComparing((object, object2) -> {
+                    double d2 = mc.player.getDistance((LivingEntity) object);
+                    double d3 = mc.player.getDistance((LivingEntity) object2);
+                    return Double.compare(d2, d3);
+                }));
+                break;
+        }
+
+        target = targets.get(0);
+    }
+
+    private boolean isWithinFOV(LivingEntity entity) {
+        float currentFOV = fov.get();
+        if (currentFOV >= 180f) {
+            return true;
+        }
+
+        double fovToEntity = getFovToEntity(entity);
+        return fovToEntity <= currentFOV;
+    }
+
+    // ================== АТАКА ==================
+
+    private void updateAttack() {
+        if (mc.player == null || mc.playerController == null || target == null) return;
+
+        selected = MouseUtil.getMouseOver(target, rotateVector.x, rotateVector.y, attackRange.get());
+
+        if (options.getValueByName("Ускорять ротацию при атаке").get()) {
+            // Увеличиваем скорость поворота на время атаки
+            float oldSpeed = rotationSpeed;
+            rotationSpeed = 18f;
+            updateLegitAim();
+            rotationSpeed = oldSpeed;
+        }
+
+        if (!canHitTarget()) {
+            return;
+        }
+
+        if (mc.player.isBlocking() && options.getValueByName("Отжимать щит").get()) {
+            mc.playerController.onStoppedUsingItem(mc.player);
+        }
+
+        attackTimer.reset();
+
+        mc.playerController.attackEntity(mc.player, target);
+        mc.player.swingArm(Hand.MAIN_HAND);
+
+        if (target instanceof PlayerEntity player && options.getValueByName("Ломать щит").get()) {
+            breakShieldPlayer(player);
+        }
+    }
+
+    private boolean canHitTarget() {
+        if (target == null) return false;
+
+        double distance = mc.player.getDistanceEyePos(target);
+        if (distance > attackRange.get()) {
+            return false;
+        }
+
+        if (options.getValueByName("Не бить через стены").get() && !hasClearLineOfSight(target)) {
+            return false;
+        }
+
+        if (!isWithinFOV(target)) {
+            return false;
+        }
+
+        Vector3d playerLook = mc.player.getLook(1.0F);
+        Vector3d targetVec = target.getPositionVec()
+                .add(0, target.getHeight() * aimHeightFactor, 0)
+                .subtract(mc.player.getEyePosition(1.0F))
+                .normalize();
+
+        double dot = playerLook.dotProduct(targetVec);
+        return dot > 0.17;
+    }
+
+    // ================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ==================
+
+    private boolean isValid(LivingEntity entity) {
+        if (entity instanceof ClientPlayerEntity) return false;
+        if (entity.ticksExisted < 3) return false;
+
+        double distanceToTarget = mc.player.getDistanceEyePos(entity);
+        if (distanceToTarget > aimRange.get()) {
+            return false;
+        }
+
+        if (!isWithinFOV(entity)) {
+            return false;
+        }
+
+        if (options.getValueByName("Не бить через стены").get() && !hasClearLineOfSight(entity)) {
+            return false;
+        }
+
+        if (entity instanceof PlayerEntity p) {
+            if (AntiBot.isBot(entity) && !targets.getValueByName("Боты").get()) {
+                return false;
+            }
+            if (!targets.getValueByName("Друзья").get() && FriendStorage.isFriend(p.getName().getString())) {
+                return false;
+            }
+            if (p.getName().getString().equalsIgnoreCase(mc.player.getName().getString())) return false;
+        }
+
+        if (entity instanceof PlayerEntity && !targets.getValueByName("Игроки").get()) {
+            return false;
+        }
+        if (entity instanceof PlayerEntity && entity.getTotalArmorValue() == 0 && !targets.getValueByName("Голые").get()) {
+            return false;
+        }
+        if (entity instanceof PlayerEntity && entity.isInvisible() && entity.getTotalArmorValue() == 0 && !targets.getValueByName("Голые невидимки").get()) {
+            return false;
+        }
+        if (entity instanceof PlayerEntity && entity.isInvisible() && !targets.getValueByName("Невидимки").get()) {
+            return false;
+        }
+
+        if (entity instanceof MonsterEntity && !targets.getValueByName("Мобы").get()) {
+            return false;
+        }
+        if (entity instanceof AnimalEntity && !targets.getValueByName("Животные").get()) {
+            return false;
+        }
+
+        return !entity.isInvulnerable() && entity.isAlive() && !(entity instanceof ArmorStandEntity);
+    }
+
+    private void breakShieldPlayer(PlayerEntity entity) {
+        if (entity.isBlocking()) {
+            int invSlot = InventoryUtil.getInstance().getAxeInInventory(false);
+            int hotBarSlot = InventoryUtil.getInstance().getAxeInInventory(true);
+
+            if (hotBarSlot == -1 && invSlot != -1) {
+                int bestSlot = InventoryUtil.getInstance().findBestSlotInHotBar();
+                mc.playerController.windowClick(0, invSlot, 0, ClickType.PICKUP, mc.player);
+                mc.playerController.windowClick(0, bestSlot + 36, 0, ClickType.PICKUP, mc.player);
+
+                mc.player.connection.sendPacket(new CHeldItemChangePacket(bestSlot));
+                mc.playerController.attackEntity(mc.player, entity);
+                mc.player.swingArm(Hand.MAIN_HAND);
+                mc.player.connection.sendPacket(new CHeldItemChangePacket(mc.player.inventory.currentItem));
+
+                mc.playerController.windowClick(0, bestSlot + 36, 0, ClickType.PICKUP, mc.player);
+                mc.playerController.windowClick(0, invSlot, 0, ClickType.PICKUP, mc.player);
+            }
+
+            if (hotBarSlot != -1) {
+                mc.player.connection.sendPacket(new CHeldItemChangePacket(hotBarSlot));
+                mc.playerController.attackEntity(mc.player, entity);
+                mc.player.swingArm(Hand.MAIN_HAND);
+                mc.player.connection.sendPacket(new CHeldItemChangePacket(mc.player.inventory.currentItem));
+            }
+        }
+    }
+
+    private boolean isUsingItem() {
+        if (!options.getValueByName("Не бить при использовании").get()) return false;
+        ItemStack item = mc.player.getHeldItemMainhand();
+        return mc.player.isHandActive() || item.getItem().isFood() || item.getItem() instanceof BowItem ||
+                item.getItem() == Items.TRIDENT || item.getItem() == Items.POTION;
+    }
+
+    private boolean hasClearLineOfSight(LivingEntity entity) {
+        Vector3d start = mc.player.getEyePosition(1.0F);
+        Vector3d end = entity.getPositionVec().add(0, entity.getHeight() * 0.5, 0);
+        RayTraceContext context = new RayTraceContext(start, end, RayTraceContext.BlockMode.COLLIDER, RayTraceContext.FluidMode.NONE, mc.player);
+        RayTraceResult result = mc.world.rayTraceBlocks(context);
+        return result.getType() == RayTraceResult.Type.MISS;
+    }
+
+    private void reset() {
+        if (options.getValueByName("Коррекция движения").get()) {
+            mc.player.rotationYawOffset = Integer.MIN_VALUE;
+        }
+        rotateVector = new Vector2f(mc.player.rotationYaw, mc.player.rotationPitch);
+        noRotationTicks = 0;
+        shouldSkipRotation = false;
+        aimHeightFactor = 0.8f;
+
+        headRandomCurrentYaw = 0f;
+        headRandomCurrentPitch = 0f;
+        headRandomTargetYaw = 0f;
+        headRandomTargetPitch = 0f;
+        headRandomChangeTimer = 0;
+
+        lastBodyYaw = 0F; // сброс тела
+    }
+
+    @Override
+    public void onEnable() {
+        super.onEnable();
+        reset();
+        target = null;
+        attackTimer.reset();
+    }
+
+    @Override
+    public void onDisable() {
+        super.onDisable();
+        reset();
+        attackTimer.setLastMS(0);
+        target = null;
+    }
+
+    // ================== МЕТРИКИ ЦЕЛИ ==================
+
+    private double getEntityArmor(PlayerEntity entityPlayer2) {
+        double d2 = 0.0;
+        for (int i2 = 0; i2 < 4; ++i2) {
+            ItemStack is = entityPlayer2.inventory.armorInventory.get(i2);
+            if (!(is.getItem() instanceof ArmorItem)) continue;
+            d2 += getProtectionLvl(is);
+        }
+        return d2;
+    }
+
+    private double getProtectionLvl(ItemStack stack) {
+        if (stack.getItem() instanceof ArmorItem i) {
+            double damageReduceAmount = i.getDamageReduceAmount();
+            if (stack.isEnchanted()) {
+                damageReduceAmount += (double) EnchantmentHelper.getEnchantmentLevel(Enchantments.PROTECTION, stack) * 0.25;
+            }
+            return damageReduceAmount;
+        }
+        return 0;
+    }
+
+    private double getEntityHealth(LivingEntity ent) {
+        if (ent instanceof PlayerEntity player) {
+            return (double) (player.getHealth() + player.getAbsorptionAmount()) * (getEntityArmor(player) / 20.0);
+        }
+        return ent.getHealth() + ent.getAbsorptionAmount();
+    }
+
+    private double getFovToEntity(LivingEntity entity) {
+        Vector3d playerLook = mc.player.getLookVec();
+        Vector3d toEntity = entity.getPositionVec().subtract(mc.player.getPositionVec()).normalize();
+        double dot = playerLook.dotProduct(toEntity);
+        return Math.acos(dot) * (180.0 / Math.PI);
+    }
+}
